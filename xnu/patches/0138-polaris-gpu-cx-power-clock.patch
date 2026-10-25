@@ -1,0 +1,228 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@
+ bsd/dev/polaris_gpu_diag.c		standard
+ bsd/dev/polaris_gpu.c			standard
+ bsd/dev/polaris_gpu_probe.c		standard
++bsd/dev/polaris_gpu_power.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,7 @@
+ extern void polaris_gpu_diag(void);
+ extern void polaris_gpu_init(void);
+ extern void polaris_gpu_probe(void);
++extern void polaris_gpu_power(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -696,6 +697,7 @@
+ 	polaris_gpu_diag();
+ 	polaris_gpu_init();
+ 	polaris_gpu_probe();
++	polaris_gpu_power();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+diff --git a/bsd/dev/polaris_gpu_power.c b/bsd/dev/polaris_gpu_power.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/polaris_gpu_power.c
+@@ -0,0 +1,193 @@
++/*
++ * Polaris A630v2 M1: switch the CX half of the GPU block on and run its
++ * clocks (GPUCC).  Nothing of the 3D core (GX/CP) is touched here.
++ *
++ * Sequence and register semantics follow the working sc7280 Adreno bring-up
++ * (redwood_adreno.c steps 3-5) mapped onto the SDM845 GPUCC offsets from
++ * drivers/clk/qcom/gpucc-sdm845.c.  Boot-arg polarisgpupwr=1 plus the
++ * Polaris board predicate; every failure stops before the next write.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern bool polaris_touch_i2c_board(void);
++
++#define GCC_PA                  0x00100000ULL
++#define GCC_SIZE                0x00090000ULL
++#define GPUCC_PA                0x05090000ULL
++#define GPUCC_SIZE              0x00010000ULL
++
++/* GCC (drivers/clk/qcom/gcc-sdm845.c) */
++#define GCC_GPU_CFG_AHB_CBCR    0x71004u
++#define GCC_GPU_MEMNOC_CBCR     0x7100cu
++#define GCC_GPU_SNOC_CBCR       0x71018u
++#define GCC_DDRSS_GPU_AXI_CBCR  0x44038u
++#define GCC_GPU_GPLL0_VOTE      0x52004u
++
++/* GPUCC (drivers/clk/qcom/gpucc-sdm845.c) */
++#define GPUCC_PLL1_MODE         0x0100u
++#define GPUCC_GX_SW_RESET       0x1008u
++#define GPUCC_GX_GDSCR          0x100cu
++#define GPUCC_GX_GMU_CBCR       0x1064u
++#define GPUCC_CX_GDSCR          0x106cu
++#define GPUCC_AHB_CBCR          0x1078u
++#define GPUCC_CX_GMU_CBCR       0x1098u
++#define GPUCC_CXO_CBCR          0x109cu
++#define GPUCC_GMU_RCGR          0x1120u
++#define GPUCC_CX_HW_CTRL        0x1540u
++#define GPUCC_GX_DOMAIN_MISC    0x158cu
++
++#define CBCR_ENABLE             (1u << 0)
++#define CBCR_OFF                (1u << 31)
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_HW_CONTROL         (1u << 1)
++#define GDSC_POWER_ON           (1u << 31)
++
++static uint32_t
++pgw_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pgw_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy; dmb oshld" ::: "memory");
++}
++
++static bool
++pgw_dump(vm_offset_t gcc, vm_offset_t gpucc, const char *where)
++{
++	printf("POLARIS GPUPWR [%s]: gcc ahb=%08x memnoc=%08x snoc=%08x ddr=%08x vote=%08x\\n", where,
++	    pgw_rd(gcc, GCC_GPU_CFG_AHB_CBCR), pgw_rd(gcc, GCC_GPU_MEMNOC_CBCR),
++	    pgw_rd(gcc, GCC_GPU_SNOC_CBCR), pgw_rd(gcc, GCC_DDRSS_GPU_AXI_CBCR),
++	    pgw_rd(gcc, GCC_GPU_GPLL0_VOTE));
++	printf("POLARIS GPUPWR [%s]: cx_gdscr=%08x cx_hw=%08x gx_gdscr=%08x gx_sw=%08x pll1=%08x\\n", where,
++	    pgw_rd(gpucc, GPUCC_CX_GDSCR), pgw_rd(gpucc, GPUCC_CX_HW_CTRL),
++	    pgw_rd(gpucc, GPUCC_GX_GDSCR), pgw_rd(gpucc, GPUCC_GX_SW_RESET),
++	    pgw_rd(gpucc, GPUCC_PLL1_MODE));
++	printf("POLARIS GPUPWR [%s]: cbcr ahb=%08x cx_gmu=%08x cxo=%08x gx_gmu=%08x rcgr=%08x src=%08x gx_misc=%08x\\n",
++	    where, pgw_rd(gpucc, GPUCC_AHB_CBCR), pgw_rd(gpucc, GPUCC_CX_GMU_CBCR),
++	    pgw_rd(gpucc, GPUCC_CXO_CBCR), pgw_rd(gpucc, GPUCC_GX_GMU_CBCR),
++	    pgw_rd(gpucc, GPUCC_GMU_RCGR), pgw_rd(gpucc, GPUCC_GMU_RCGR + 4),
++	    pgw_rd(gpucc, GPUCC_GX_DOMAIN_MISC));
++	return true;
++}
++
++static bool
++pgw_clock_on(vm_offset_t base, const char *name, uint32_t off, bool must)
++{
++	uint32_t v = pgw_rd(base, off);
++	if ((v & CBCR_OFF) == 0) {
++		return true;
++	}
++	pgw_wr(base, off, v | CBCR_ENABLE);
++	for (int i = 0; i < 200; i++) {
++		if ((pgw_rd(base, off) & CBCR_OFF) == 0) {
++			printf("POLARIS GPUPWR: %s on (%08x)\\n", name, pgw_rd(base, off));
++			return true;
++		}
++		delay(10);
++	}
++	printf("POLARIS GPUPWR: %s stays off (%08x)%s\\n", name, pgw_rd(base, off),
++	    must ? "" : "; status not reliable, continuing");
++	return !must;
++}
++
++static bool
++pgw_clock_source(vm_offset_t gpucc, const char *name, uint32_t rcgr, uint32_t source)
++{
++	uint32_t was = pgw_rd(gpucc, rcgr + 4);
++	if ((was & 0x371fu) == source) {
++		return true;
++	}
++	pgw_wr(gpucc, rcgr + 4, (was & ~0x371fu) | source);
++	pgw_wr(gpucc, rcgr, pgw_rd(gpucc, rcgr) | (1u << 0));
++	for (int i = 0; i < 200; i++) {
++		if ((pgw_rd(gpucc, rcgr) & (1u << 0)) == 0) {
++			printf("POLARIS GPUPWR: %s source -> %03x (src reg %08x)\\n", name, source,
++			    pgw_rd(gpucc, rcgr + 4));
++			return true;
++		}
++		delay(10);
++	}
++	printf("POLARIS GPUPWR: %s source does not take (%08x)\\n", name, pgw_rd(gpucc, rcgr));
++	return false;
++}
++
++void
++polaris_gpu_power(void)
++{
++	int optin = 0;
++	(void)PE_parse_boot_argn("polarisgpupwr", &optin, sizeof(optin));
++	if (optin != 1 || !polaris_touch_i2c_board()) {
++		return;
++	}
++
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	vm_offset_t gpucc = ml_io_map(GPUCC_PA, GPUCC_SIZE);
++	if (gcc == 0 || gpucc == 0) {
++		printf("POLARIS GPUPWR: map failed (gcc %p gpucc %p)\\n", (void *)gcc, (void *)gpucc);
++		return;
++	}
++
++	printf("POLARIS GPUPWR: step 1: read state before anything\\n");
++	pgw_dump(gcc, gpucc, "before");
++	if ((pgw_rd(gcc, GCC_GPU_CFG_AHB_CBCR) & CBCR_OFF) != 0) {
++		printf("POLARIS GPUPWR: gpu_cfg_ahb is off; GPUCC is unreachable, stopping\\n");
++		return;
++	}
++
++	printf("POLARIS GPUPWR: step 2: CX power on (clear gpu_cx_gdsc SW_COLLAPSE)\\n");
++	uint32_t gdscr = pgw_rd(gpucc, GPUCC_CX_GDSCR);
++	uint32_t hw = pgw_rd(gpucc, GPUCC_CX_HW_CTRL);
++	bool cx_on = ((gdscr | hw) & GDSC_POWER_ON) != 0;
++	if (!cx_on) {
++		if (gdscr & GDSC_HW_CONTROL) {
++			printf("POLARIS GPUPWR: CX switch is under hardware control (%08x); stopping\\n", gdscr);
++			return;
++		}
++		pgw_wr(gpucc, GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++		for (int i = 0; i < 500; i++) {
++			if (((pgw_rd(gpucc, GPUCC_CX_GDSCR) | pgw_rd(gpucc, GPUCC_CX_HW_CTRL)) & GDSC_POWER_ON) != 0) {
++				cx_on = true;
++				break;
++			}
++			delay(1);
++		}
++	}
++	if (!cx_on) {
++		printf("POLARIS GPUPWR: CX did not come on (gdscr %08x hw %08x); stopping before clocks\\n",
++		    pgw_rd(gpucc, GPUCC_CX_GDSCR), pgw_rd(gpucc, GPUCC_CX_HW_CTRL));
++		return;
++	}
++	printf("POLARIS GPUPWR: CX is on (gdscr %08x hw %08x)\\n",
++	    pgw_rd(gpucc, GPUCC_CX_GDSCR), pgw_rd(gpucc, GPUCC_CX_HW_CTRL));
++
++	printf("POLARIS GPUPWR: step 3: GCC GPU clocks (memnoc/snoc/ddr) + GPLL0 tap vote\\n");
++	(void)pgw_clock_on(gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_CBCR, false);
++	(void)pgw_clock_on(gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_CBCR, true);
++	(void)pgw_clock_on(gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, false);
++	pgw_wr(gcc, GCC_GPU_GPLL0_VOTE, pgw_rd(gcc, GCC_GPU_GPLL0_VOTE) | (1u << 15) | (1u << 16));
++
++	printf("POLARIS GPUPWR: step 4: GPUCC clocks (CXO, CX GMU) and GMU clk src = GPLL0/1.5 (200 MHz)\\n");
++	(void)pgw_clock_source(gpucc, "gmu_clk_src", GPUCC_GMU_RCGR, (6u << 8) | 2u);
++	if (!pgw_clock_on(gpucc, "cxo", GPUCC_CXO_CBCR, true)) {
++		return;
++	}
++	if (!pgw_clock_on(gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true)) {
++		return;
++	}
++
++	printf("POLARIS GPUPWR: final state\\n");
++	pgw_dump(gcc, gpucc, "after");
++	printf("POLARIS GPUPWR: M1 done (CX on, clocks requested); 3D core/GX untouched\\n");
++}
++#endif
